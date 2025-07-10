@@ -1,0 +1,3 @@
+pymavlink
+paho-mqtt
+colorama
