@@ -1,3 +1,4 @@
 pymavlink
 paho-mqtt
 colorama
+# Ricorda di configurare PUBLISH_INTERVAL nel file .env (default: 3 secondi)
