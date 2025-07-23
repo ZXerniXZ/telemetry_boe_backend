@@ -60,7 +60,7 @@ MIN_LAST_OCTET = int(os.environ.get("MIN_LAST_OCTET", "30"))
 serializer_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="json")
 active_boes = {}        # {boa_key: (thread, stop_event)}
 active_boes_lock = threading.Lock()
-active_vaia = {}        # {boa_key: (thread, stop_event)}
+active_vaia = {}        # {boa_key: (thread, stop_event, vaia_info)}
 active_vaia_lock = threading.Lock()
 
 # Logging
@@ -690,6 +690,16 @@ def vaia(req: VaiaRequest):
             raise HTTPException(400, "Vaia già attivo per questa boa")
         
         stop_event = threading.Event()
+        
+        # Crea le informazioni del comando vaia
+        vaia_info = {
+            "lat": req.lat,
+            "lon": req.lon,
+            "alt": req.alt,
+            "started_at": time.time(),
+            "status": "active"
+        }
+        
         t = threading.Thread(
             target=vaia_thread,
             name=f"vaia-{boa_key}",
@@ -697,7 +707,7 @@ def vaia(req: VaiaRequest):
             daemon=True,
         )
         t.start()
-        active_vaia[boa_key] = (t, stop_event)
+        active_vaia[boa_key] = (t, stop_event, vaia_info)
     
     return {"status": "started", "boa": boa_key}
 
@@ -712,9 +722,82 @@ def stop_vaia(req: VaiaStopRequest):
         if not entry:
             raise HTTPException(404, "Nessun vaia attivo per questa boa")
         
-        t, stop_event = entry
+        t, stop_event, vaia_info = entry
         stop_event.set()
         t.join(timeout=5)
         active_vaia.pop(boa_key, None)
     
     return {"status": "stopped", "boa": boa_key}
+
+
+@app.get("/isgoing/{ip}/{port}")
+def isgoing(ip: str, port: int):
+    """Verifica se una boa ha un comando di navigazione attivo."""
+    boa_key = f"{ip}:{port}"
+    
+    with active_vaia_lock:
+        is_active = boa_key in active_vaia
+        if is_active:
+            t, stop_event, vaia_info = active_vaia[boa_key]
+            # Verifica se il thread è ancora vivo
+            is_active = t.is_alive()
+            if not is_active:
+                # Thread morto, rimuovi dall'elenco
+                active_vaia.pop(boa_key, None)
+                return {"isgoing": False, "boa": boa_key, "destination": None}
+            
+            # Calcola tempo trascorso
+            elapsed_time = time.time() - vaia_info["started_at"]
+            
+            return {
+                "isgoing": True,
+                "boa": boa_key,
+                "destination": {
+                    "lat": vaia_info["lat"],
+                    "lon": vaia_info["lon"],
+                    "alt": vaia_info["alt"]
+                },
+                "started_at": vaia_info["started_at"],
+                "elapsed_time": elapsed_time,
+                "status": vaia_info["status"]
+            }
+    
+    return {"isgoing": False, "boa": boa_key, "destination": None}
+
+
+@app.get("/isgoing")
+def isgoing_all():
+    """Verifica lo stato di navigazione di tutte le boe."""
+    with active_vaia_lock:
+        result = {}
+        # Crea una copia delle chiavi per evitare modifiche durante l'iterazione
+        active_keys = list(active_vaia.keys())
+        
+        for boa_key in active_keys:
+            t, stop_event, vaia_info = active_vaia[boa_key]
+            is_active = t.is_alive()
+            if not is_active:
+                # Thread morto, rimuovi dall'elenco
+                active_vaia.pop(boa_key, None)
+            else:
+                # Calcola tempo trascorso
+                elapsed_time = time.time() - vaia_info["started_at"]
+                result[boa_key] = {
+                    "isgoing": True,
+                    "destination": {
+                        "lat": vaia_info["lat"],
+                        "lon": vaia_info["lon"],
+                        "alt": vaia_info["alt"]
+                    },
+                    "started_at": vaia_info["started_at"],
+                    "elapsed_time": elapsed_time,
+                    "status": vaia_info["status"]
+                }
+        
+        # Aggiungi tutte le boe attive (anche quelle senza vaia)
+        with active_boes_lock:
+            for boa_key in active_boes.keys():
+                if boa_key not in result:
+                    result[boa_key] = {"isgoing": False}
+    
+    return {"boes": result}
