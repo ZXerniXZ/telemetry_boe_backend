@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pymavlink
+paho-mqtt
+python-dotenv
+pydantic
+python-nmap
+colorama

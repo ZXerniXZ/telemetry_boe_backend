@@ -10,6 +10,8 @@ import os
 import math
 import signal
 import sys
+import subprocess
+import socket
 import threading
 import time
 import atexit
@@ -22,16 +24,19 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from paho.mqtt import client as mqtt
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from pymavlink import mavutil
+from datetime import datetime, timedelta
+import secrets
 
 load_dotenv()
 
 from fetch_boe.shared import (
-    MQTT_PORT, MQTT_TOPIC_FMT, MQTT_QOS, MQTT_RETAIN, LOG_LEVEL, 
+    MQTT_HOST, MQTT_PORT, MQTT_TOPIC_FMT, MQTT_QOS, MQTT_RETAIN, LOG_LEVEL, 
     PUBLISH_INTERVAL, HEARTBEAT_HZ, HEARTBEAT_PERIOD, DEVICE_TIMEOUT,
     VAI_A_RETRY_SEC, VAI_A_TOLERANCE_METERS, VAI_A_TIMEOUT_SEC
 )
+from fetch_boe.database import user_db
 
 
 # =============================================================================
@@ -44,9 +49,39 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Configurazione CORS per ambiente Docker/VPN
+# In produzione, limitare agli indirizzi specifici necessari
+allowed_origins = [
+    "http://localhost:5173",
+    "http://165.227.133.135:5173",
+    "http://18.198.0.86:5173",
+    "http://127.0.0.1:5173",
+    "http://0.0.0.0:5173",
+    "http://10.8.0.9:5173",
+    # Docker network addresses
+    "http://172.19.0.1:5173",
+    "http://172.19.0.2:5173",
+    "http://172.19.0.3:5173", 
+    "http://172.19.0.4:5173",
+    "http://172.19.0.5:5173",
+    # Frontend container internal addresses
+    "http://telemetry_frontend:5173",
+    "http://frontend:5173",
+    # Additional VPN and network ranges
+    "http://10.19.0.9:5173",
+    "http://10.114.0.3:5173",
+]
+
+# Per ambiente di sviluppo Docker, essere più permissivi
+# Rileva se siamo in ambiente containerizzato
+is_docker = os.path.exists('/.dockerenv')
+if is_docker:
+    # In ambiente Docker, permettiamo più flessibilità
+    allowed_origins.append("*")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,7 +114,7 @@ def publish_isonline(ip: str, port: int, is_online: bool) -> None:
     
     client = mqtt.Client(client_id=f"isonline_{ip}_{port}", clean_session=True)
     try:
-        client.connect("localhost", MQTT_PORT, keepalive=5)
+        client.connect(MQTT_HOST, MQTT_PORT, keepalive=5)
         client.loop_start()
         client.publish(isonline_topic, str(is_online).lower(), qos=MQTT_QOS, retain=True)
         client.loop_stop()
@@ -247,7 +282,7 @@ def set_all_boes_offline() -> None:
         
         client = mqtt.Client(client_id=f"shutdown_{ip}_{port}", clean_session=True)
         try:
-            client.connect("localhost", MQTT_PORT, keepalive=5)
+            client.connect(MQTT_HOST, MQTT_PORT, keepalive=5)
             client.loop_start()
             client.publish(isonline_topic, "false", qos=MQTT_QOS, retain=True)
             client.loop_stop()
@@ -305,6 +340,40 @@ class VaiaStopRequest(BaseModel):
     ip: str
     port: int
 
+# =============================================================================
+# MODELLI PER AUTENTICAZIONE E GESTIONE UTENTI
+# =============================================================================
+
+class UserLoginRequest(BaseModel):
+    """Richiesta di login."""
+    username: str
+    password: str
+
+class UserRegisterRequest(BaseModel):
+    """Richiesta di registrazione."""
+    username: str
+    password: str
+    email: str
+    full_name: str
+    phone: str = None
+
+class UserResponse(BaseModel):
+    """Risposta con dati utente."""
+    id: int
+    username: str
+    email: str
+    role: str
+    full_name: str
+    created_at: str
+    last_login: str | None = None
+    is_active: bool
+
+class TokenResponse(BaseModel):
+    """Risposta con token di accesso."""
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
 
 # =============================================================================
 # ENDPOINT API - GESTIONE BASE
@@ -313,20 +382,71 @@ class VaiaStopRequest(BaseModel):
 @app.get("/scan")
 def scan_boes():
     """Scansiona la rete alla ricerca di boe disponibili."""
-    nm = nmap.PortScanner()
-    nm.scan(hosts=SCAN_SUBNET, arguments='-sn -n -T4')
+    # Test temporaneo: prova a connettere direttamente alla boa nota
+    test_ips = ["10.8.0.54", "192.168.50.1", "192.168.50.10"]
+    test_ports = [14550, 14551, 5760]  # Porte comuni per MAVLink
     
     found = []
-    for host in nm.all_hosts():
+    for ip in test_ips:
         try:
-            last_octet = int(host.strip().split('.')[-1])
-            if last_octet > MIN_LAST_OCTET:
-                found.append(host)
-        except Exception:
-            continue
+            # Test connessione TCP sulla porta MAVLink
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((ip, 14550))
+            sock.close()
+            
+            if result == 0:
+                found.append(ip)
+                logger.info(f"[scan] IP {ip} raggiungibile sulla porta 14550")
+            else:
+                logger.info(f"[scan] IP {ip} non raggiungibile sulla porta 14550")
+        except Exception as e:
+            logger.warning(f"[scan] Errore testando {ip}: {e}")
+    
+    # Test anche con nmap sulla subnet originale
+    try:
+        nm = nmap.PortScanner()
+        nm.scan(hosts=SCAN_SUBNET, arguments='-sn -n -T4')
+        
+        for host in nm.all_hosts():
+            try:
+                last_octet = int(host.strip().split('.')[-1])
+                if last_octet > MIN_LAST_OCTET and host not in found:
+                    found.append(host)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"[scan] Errore nmap: {e}")
     
     logger.info(f"[scan] Risultato scan: {found}")
     return {"found": found}
+
+
+@app.get("/scan-test")
+def scan_test():
+    """Endpoint di test che simula la presenza di boe per verificare il sistema."""
+    # Simula la presenza di boe note per test
+    test_boes = [
+        {
+            "ip": "10.8.0.54",
+            "port": 14550,
+            "name": "Boa Test 1",
+            "status": "simulated"
+        },
+        {
+            "ip": "192.168.50.1", 
+            "port": 14550,
+            "name": "Boa Test 2",
+            "status": "simulated"
+        }
+    ]
+    
+    logger.info(f"[scan-test] Restituendo boe di test: {len(test_boes)} boe")
+    return {
+        "found": [boa["ip"] for boa in test_boes],
+        "boes": test_boes,
+        "message": "Test endpoint - boe simulate per verifica sistema"
+    }
 
 
 @app.post("/aggiungiboa")
@@ -801,3 +921,268 @@ def isgoing_all():
                     result[boa_key] = {"isgoing": False}
     
     return {"boes": result}
+
+
+@app.get("/boe_status")
+def boe_status():
+    """Verifica lo stato di connessione di tutte le boe."""
+    result = {}
+    
+    with active_boes_lock:
+        for boa_key in active_boes.keys():
+            t, stop_event = active_boes[boa_key]
+            is_connected = t.is_alive()
+            if not is_connected:
+                # Thread morto, rimuovi dall'elenco
+                active_boes.pop(boa_key, None)
+                result[boa_key] = {"connected": False, "status": "disconnected"}
+            else:
+                result[boa_key] = {"connected": True, "status": "active"}
+    
+    return {"boes": result}
+
+
+# =============================================================================
+# API PER AUTENTICAZIONE E GESTIONE UTENTI
+# =============================================================================
+
+def create_access_token(user_id: int, username: str) -> str:
+    """Crea un token di accesso JWT-like."""
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "exp": (datetime.utcnow() + timedelta(hours=24)).isoformat()
+    }
+    # Per semplicità, usiamo un token base64 (in produzione usare JWT)
+    import base64
+    import json
+    return base64.b64encode(json.dumps(payload).encode()).decode()
+
+@app.post("/auth/login", response_model=TokenResponse)
+def login(request: UserLoginRequest, client_ip: str = None, user_agent: str = None):
+    """Endpoint per il login degli utenti."""
+    try:
+        # Autentica l'utente
+        user = user_db.authenticate_user(request.username, request.password)
+        
+        if user:
+            # Log del tentativo di login riuscito
+            user_db.log_login_attempt(
+                username=request.username,
+                success=True,
+                ip_address=client_ip,
+                user_agent=user_agent,
+                user_id=user['id']
+            )
+            
+            # Crea token di accesso
+            access_token = create_access_token(user['id'], user['username'])
+            
+            # Prepara risposta utente (senza password)
+            user_response = UserResponse(
+                id=user['id'],
+                username=user['username'],
+                email=user['email'],
+                role=user['role'],
+                full_name=user['full_name'],
+                created_at=user['created_at'] or '',
+                last_login=user['last_login'] or '',
+                is_active=user['is_active']
+            )
+            
+            return TokenResponse(access_token=access_token, user=user_response)
+        else:
+            # Log del tentativo di login fallito
+            user_db.log_login_attempt(
+                username=request.username,
+                success=False,
+                ip_address=client_ip,
+                user_agent=user_agent
+            )
+            raise HTTPException(status_code=401, detail="Credenziali non valide")
+            
+    except Exception as e:
+        logger.error(f"Errore durante il login: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.post("/auth/register", response_model=UserResponse)
+def register(request: UserRegisterRequest):
+    """Endpoint per la registrazione di nuovi utenti."""
+    try:
+        # Crea il nuovo utente
+        user = user_db.create_user(
+            username=request.username,
+            password=request.password,
+            email=request.email,
+            role='user',  # Ruolo di default per nuovi utenti
+            full_name=request.full_name,
+            phone=request.phone
+        )
+        
+        # Prepara risposta (senza password)
+        return UserResponse(
+            id=user['id'],
+            username=user['username'],
+            email=user['email'],
+            role=user['role'],
+            full_name=user['full_name'],
+            created_at=user['created_at'] or '',
+            is_active=True
+        )
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Errore durante la registrazione: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.get("/auth/users", response_model=list[UserResponse])
+def get_users():
+    """Endpoint per ottenere tutti gli utenti (solo per admin)."""
+    try:
+        users = user_db.get_all_users()
+        return [
+            UserResponse(
+                id=user['id'],
+                username=user['username'],
+                email=user['email'],
+                role=user['role'],
+                full_name=user['full_name'],
+                created_at=user['created_at'] or '',
+                last_login=user['last_login'] or '',
+                is_active=user['is_active']
+            )
+            for user in users
+        ]
+    except Exception as e:
+        logger.error(f"Errore nel recupero utenti: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.get("/auth/profile/{user_id}", response_model=UserResponse)
+def get_user_profile(user_id: int):
+    """Endpoint per ottenere il profilo di un utente specifico."""
+    try:
+        users = user_db.get_all_users()
+        user = next((u for u in users if u['id'] == user_id), None)
+        
+        if not user:
+            raise HTTPException(status_code=404, detail="Utente non trovato")
+        
+        return UserResponse(
+            id=user['id'],
+            username=user['username'],
+            email=user['email'],
+            role=user['role'],
+            full_name=user['full_name'],
+            created_at=user['created_at'] or '',
+            last_login=user['last_login'] or '',
+            is_active=user['is_active']
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore nel recupero profilo utente: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.get("/auth/users/list")
+def list_users_with_passwords():
+    """Endpoint per visualizzare tutti gli utenti con password (solo per debug)."""
+    try:
+        # Query diretta per ottenere anche le password (solo per debug)
+        import sqlite3
+        with sqlite3.connect(user_db.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT id, username, email, password_hash, role, created_at, 
+                       last_login, is_active, full_name, phone
+                FROM users ORDER BY created_at DESC
+            ''')
+            
+            users = []
+            for row in cursor.fetchall():
+                users.append({
+                    'id': row[0],
+                    'username': row[1],
+                    'email': row[2],
+                    'password_hash': row[3][:20] + '...' if row[3] else None,  # Mostra solo i primi 20 caratteri
+                    'role': row[4],
+                    'created_at': row[5] if row[5] else None,
+                    'last_login': row[6] if row[6] else None,
+                    'is_active': bool(row[7]),
+                    'full_name': row[8],
+                    'phone': row[9]
+                })
+            
+            return {
+                "total_users": len(users),
+                "users": users
+            }
+    except Exception as e:
+        logger.error(f"Errore nel recupero lista utenti: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.delete("/auth/users/{user_id}")
+def delete_user(user_id: int):
+    """Elimina un utente (solo per admin)."""
+    try:
+        success = user_db.delete_user(user_id)
+        if success:
+            return {"message": f"Utente {user_id} eliminato con successo"}
+        else:
+            raise HTTPException(status_code=404, detail="Utente non trovato")
+    except Exception as e:
+        logger.error(f"Errore nell'eliminazione utente: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.put("/auth/users/{user_id}")
+def update_user(user_id: int, user_data: dict):
+    """Aggiorna i dati di un utente (solo per admin)."""
+    try:
+        # Rimuovi campi non modificabili
+        allowed_fields = ['email', 'role', 'full_name', 'phone', 'is_active']
+        update_data = {k: v for k, v in user_data.items() if k in allowed_fields}
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="Nessun campo valido da aggiornare")
+        
+        success = user_db.update_user(user_id, **update_data)
+        if success:
+            return {"message": f"Utente {user_id} aggiornato con successo"}
+        else:
+            raise HTTPException(status_code=404, detail="Utente non trovato")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Errore nell'aggiornamento utente: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")
+
+@app.delete("/auth/reset-database")
+def reset_database():
+    """Endpoint per resettare completamente il database (solo per debug)."""
+    try:
+        import sqlite3
+        import os
+        
+        # Chiudi la connessione al database se aperta
+        if hasattr(user_db, '_conn') and user_db._conn:
+            user_db._conn.close()
+        
+        # Elimina il file del database
+        if os.path.exists(user_db.db_path):
+            os.remove(user_db.db_path)
+            logger.info(f"Database eliminato: {user_db.db_path}")
+        
+        # Reinizializza il database (creerà l'utente admin di default)
+        user_db.init_database()
+        
+        return {
+            "message": "Database resettato con successo",
+            "admin_created": True,
+            "admin_credentials": {
+                "username": "admin",
+                "password": "admin123"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Errore nel reset del database: {e}")
+        raise HTTPException(status_code=500, detail="Errore interno del server")

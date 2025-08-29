@@ -17,7 +17,7 @@ from pymavlink import mavutil
 
 # ---- fetch_boe import ------------------------------------------------
 from fetch_boe.shared import (
-    stop_event, MQTT_PORT, MQTT_TOPIC_FMT, MQTT_QOS, MQTT_RETAIN, LOG_LEVEL, PUBLISH_INTERVAL, HEARTBEAT_HZ, HEARTBEAT_PERIOD, DEVICE_TIMEOUT
+    stop_event, MQTT_HOST, MQTT_PORT, MQTT_TOPIC_FMT, MQTT_QOS, MQTT_RETAIN, LOG_LEVEL, PUBLISH_INTERVAL, HEARTBEAT_HZ, HEARTBEAT_PERIOD, DEVICE_TIMEOUT
 )
 
 import os
@@ -43,7 +43,7 @@ logger = logging.getLogger("telemetry_backend")
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://10.8.0.9:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -126,7 +126,7 @@ def set_all_boes_offline():
         isonline_topic = f"{topic_base}/isonline"
         client = mqtt.Client(client_id=f"shutdown_{ip}_{port}", clean_session=True)
         try:
-            client.connect("localhost", MQTT_PORT, keepalive=5)
+            client.connect(MQTT_HOST, MQTT_PORT, keepalive=5)
             client.loop_start()
             client.publish(isonline_topic, "false", qos=MQTT_QOS, retain=True)
             client.loop_stop()
@@ -223,7 +223,7 @@ def handle_device(ip: str, port: int, pool: ThreadPoolExecutor, stop_event=None)
     client = mqtt.Client(client_id=client_id, clean_session=False)
     client.enable_logger(logger)
     try:
-        client.connect("localhost", MQTT_PORT, keepalive=30)
+        client.connect(MQTT_HOST, MQTT_PORT, keepalive=30)
     except Exception as exc:
         logger.error(f"[{ip}:{port}] MQTT connect failed: {exc}")
     client.loop_start()

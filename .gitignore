@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+backend.log
+users.db
+venv/
+__pycache__/
+*.pyc
+backend.log
+users.db
+venv/

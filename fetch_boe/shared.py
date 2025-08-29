@@ -3,6 +3,7 @@ import threading
 
 stop_event = threading.Event()
 
+MQTT_HOST = os.environ.get("MQTT_HOST", "10.8.0.9")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_TOPIC_FMT = os.environ.get("MQTT_TOPIC_FMT", "mavlink/{}/json")
 MQTT_QOS = int(os.environ.get("MQTT_QOS", "0"))
